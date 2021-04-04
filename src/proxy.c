@@ -1,133 +1,67 @@
 /* ------------------------------------------------------------------
- * Ella Proxy - Proxy Task
+ * V-Socks - Proxy Task Source Code
  * ------------------------------------------------------------------ */
 
-#include "ella.h"
+#include "proxy.h"
+#include <linux/netfilter_ipv4.h>
 
 /**
- * IP/TCP connection stream 
+ * Check socket error
  */
-struct stream_t
+static int socket_has_error ( int sock )
 {
-    int role;
-    int fd;
-    int polled;
-    int level;
+    int so_error = 0;
+    socklen_t len = sizeof ( so_error );
 
-#ifdef STATIC_POOL
-    int allocated;
-#endif
-
-    struct stream_t *neighbour;
-    struct stream_t *prev;
-    struct stream_t *next;
-};
-
-/**
- * Ella Proxy program variables
- */
-static int exit_flag = 0;
-static struct stream_t *stream_list;
-static size_t poll_len = 0;
-static int poll_modified = 1;
-#ifndef STATIC_POOL
-static size_t poll_size = POLL_BASE_SIZE;
-static struct pollfd *poll_list;
-#else
-static size_t poll_size = STATIC_POOL_SIZE;
-static struct pollfd poll_list[STATIC_POOL_SIZE];
-static struct stream_t stream_pool[STATIC_POOL_SIZE];
-#endif
-
-/**
- * Expand poll event list
- */
-static int poll_expand ( void )
-{
-#ifndef STATIC_POOL
-    size_t size_backup = poll_size;
-    struct pollfd *list_backup = poll_list;
-
-    poll_size <<= 1;
-
-    if ( !( poll_list =
-            ( struct pollfd * ) realloc ( poll_list, poll_size * sizeof ( struct pollfd ) ) ) )
+    /* Read socket error */
+    if ( getsockopt ( sock, SOL_SOCKET, SO_ERROR, &so_error, &len ) < 0 )
     {
-        errno = ENOMEM;
-        free ( list_backup );
         return -1;
     }
 
-    while ( size_backup < poll_size )
+    /* Analyze socket error */
+    return !!so_error;
+}
+
+/**
+ * Set socket non-blocking mode
+ */
+static int socket_set_nonblocking ( int sock )
+{
+    long mode = 0;
+
+    /* Get current socket mode */
+    if ( ( mode = fcntl ( sock, F_GETFL, 0 ) ) < 0 )
     {
-        poll_list[size_backup++].events = POLLIN;
+        return -1;
+    }
+
+    /* Update socket mode */
+    if ( fcntl ( sock, F_SETFL, mode | O_NONBLOCK ) < 0 )
+    {
+        return -1;
     }
 
     return 0;
-#else
-    return -1;
-#endif
 }
 
 /**
- * Allocate stream structure and insert into the list
+ * Shutdown and close the socket
  */
-static struct stream_t *insert_stream ( int role, int sock )
+static void shutdown_then_close ( int sock )
 {
-    struct stream_t *stream;
-#ifdef STATIC_POOL
-    size_t i;
-#endif
-
-#ifndef STATIC_POOL
-    if ( !( stream = malloc ( sizeof ( struct stream_t ) ) ) )
-    {
-        return NULL;
-    }
-#else
-    for ( i = 0, stream = NULL; i < sizeof ( stream_pool ) / sizeof ( struct stream_t ); i++ )
-    {
-        if ( !stream_pool[i].allocated )
-        {
-            stream = &stream_pool[i];
-            break;
-        }
-    }
-
-    if ( !stream )
-    {
-        return NULL;
-    }
-
-    stream->allocated = 1;
-#endif
-
-    stream->role = role;
-    stream->fd = sock;
-    stream->neighbour = NULL;
-    stream->level = LEVEL_NONE;
-    stream->prev = NULL;
-    stream->next = stream_list;
-
-    if ( stream_list )
-    {
-        stream_list->prev = stream;
-    }
-    stream_list = stream;
-
-    poll_modified = 1;
-    return stream;
+    shutdown ( sock, SHUT_RDWR );
+    close ( sock );
 }
 
 /**
- * Bind address to socket and set listen mode
+ * Bind address to listen socket
  */
-static int listen_socket ( unsigned int addr, unsigned short port, int role )
+static int listen_socket ( unsigned int addr, unsigned short port )
 {
     int sock;
     int yes = 1;
     struct sockaddr_in saddr;
-    struct stream_t *stream;
 
     /* Prepare socket address */
     memset ( &saddr, '\0', sizeof ( saddr ) );
@@ -144,28 +78,21 @@ static int listen_socket ( unsigned int addr, unsigned short port, int role )
     /* Allow reusing socket address */
     if ( setsockopt ( sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof ( yes ) ) < 0 )
     {
-        close ( sock );
+        shutdown_then_close ( sock );
         return -1;
     }
 
     /* Bind socket to address */
     if ( bind ( sock, ( struct sockaddr * ) &saddr, sizeof ( saddr ) ) < 0 )
     {
-        close ( sock );
+        shutdown_then_close ( sock );
         return -1;
     }
 
     /* Put socket into listen mode */
     if ( listen ( sock, LISTEN_BACKLOG ) < 0 )
     {
-        close ( sock );
-        return -1;
-    }
-
-    /* Allocate new stream */
-    if ( !( stream = insert_stream ( role, sock ) ) )
-    {
-        close ( sock );
+        shutdown_then_close ( sock );
         return -1;
     }
 
@@ -173,44 +100,111 @@ static int listen_socket ( unsigned int addr, unsigned short port, int role )
 }
 
 /**
- * Show relations statistics
+ * Push bytes to queue
  */
-#ifndef SILENT_MODE
-static void show_stats ( void )
+static int queue_push ( struct queue_t *queue, const unsigned char *bytes, size_t len )
 {
-    int assoc_count = 0;
-    int total_count = 0;
-    struct stream_t *iter = stream_list;
-
-    while ( iter )
+    if ( queue->len + len > sizeof ( queue->arr ) )
     {
-        if ( iter->role == S_PORT_A || iter->role == S_PORT_B )
-        {
-            if ( iter->neighbour )
-            {
-                assoc_count++;
-            }
-            total_count++;
-        }
-
-        iter = iter->next;
+        return -1;
     }
 
-    N ( printf ( "[ella] relations: S %i A %i\n", assoc_count / 2,
-            total_count - assoc_count + ( assoc_count / 2 ) ) );
+    memcpy ( queue->arr + queue->len, bytes, len );
+    queue->len += len;
+    return 0;
 }
-#endif
+
+
+/**
+ * Shift bytes to queue
+ */
+static int queue_shift ( struct queue_t *queue, int fd )
+{
+    size_t i;
+    ssize_t len;
+
+    if ( ( len = send ( fd, queue->arr, queue->len, MSG_NOSIGNAL ) ) < 0 )
+    {
+        return -1;
+    }
+
+    queue->len -= len;
+
+    for ( i = 0; i < queue->len; i++ )
+    {
+        queue->arr[i] = queue->arr[len + i];
+    }
+
+    return 0;
+}
+
+/**
+ * Allocate stream structure and insert into the list
+ */
+static struct stream_t *insert_stream ( struct proxy_t *proxy, int sock )
+{
+    struct stream_t *stream;
+    size_t i;
+
+    for ( i = 0, stream = NULL; i < POOL_SIZE; i++ )
+    {
+        if ( !proxy->stream_pool[i].allocated )
+        {
+            stream = proxy->stream_pool + i;
+            break;
+        }
+    }
+
+    if ( !stream )
+    {
+        return NULL;
+    }
+
+    memset ( stream, '\0', sizeof ( struct stream_t ) );
+    stream->role = S_INVALID;
+    stream->fd = sock;
+    stream->level = LEVEL_NONE;
+    stream->allocated = 1;
+    stream->next = proxy->stream_head;
+
+    if ( proxy->stream_head )
+    {
+        proxy->stream_head->prev = stream;
+
+    } else
+    {
+        proxy->stream_tail = stream;
+    }
+
+    proxy->stream_head = stream;
+
+    return stream;
+}
 
 /**
  * Free and remove a single stream from the list
  */
-static void remove_stream ( struct stream_t *stream )
+static void remove_stream ( struct proxy_t *proxy, struct stream_t *stream )
 {
-    FREE_SOCKET ( stream->fd );
-
-    if ( stream == stream_list )
+    if ( stream->fd >= 0 )
     {
-        stream_list = stream->next;
+        if ( stream->pollref )
+        {
+            epoll_ctl ( proxy->epoll_fd, EPOLL_CTL_DEL, stream->fd, NULL );
+        }
+
+        shutdown_then_close ( stream->fd );
+        stream->fd = -1;
+    }
+
+    if ( stream == proxy->stream_head )
+    {
+        proxy->stream_head = stream->next;
+    }
+
+    if ( stream == proxy->stream_tail )
+    {
+        proxy->stream_tail = stream->prev;
     }
 
     if ( stream->next )
@@ -222,94 +216,476 @@ static void remove_stream ( struct stream_t *stream )
     {
         stream->prev->next = stream->next;
     }
-#ifndef STATIC_POOL
-    free ( stream );
-#else
+
     stream->allocated = 0;
-#endif
-    poll_modified = 1;
 }
 
+/**
+ * Show relations statistics
+ */
+#ifdef VERBOSE_MODE
+static void show_stats ( struct proxy_t *proxy )
+{
+    int a_forwarding = 0;
+    int b_forwarding = 0;
+    int a_total = 0;
+    int b_total = 0;
+    int total = 0;
+    struct stream_t *iter;
+
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
+    {
+        if ( iter->role == S_PORT_A )
+        {
+            if ( iter->level == LEVEL_FORWARDING )
+            {
+                a_forwarding++;
+            }
+            a_total++;
+
+        } else if ( iter->role == S_PORT_B )
+        {
+            if ( iter->level == LEVEL_FORWARDING )
+            {
+                b_forwarding++;
+            }
+            b_total++;
+        }
+
+        total++;
+    }
+
+    S ( printf ( "[vsck] load: A:%i/%i B:%i/%i *:%i/%i\n", a_forwarding, a_total, b_forwarding,
+            b_total, total, POOL_SIZE ) );
+}
+#endif
+
 /*
- * Remove pair of associated streams
+ * Abandon associated pair of streams
  */
 static void remove_relation ( struct stream_t *stream )
 {
     if ( stream->neighbour )
     {
-        remove_stream ( stream->neighbour );
+        stream->neighbour->abandoned = 1;
     }
-    remove_stream ( stream );
-    N ( printf ( "[ella] removed relation.\n" ) );
-#ifndef SILENT_MODE
-    show_stats (  );
-#endif
+    stream->abandoned = 1;
 }
 
 /**
  * Remove all relations
  */
-static void empty_rels ( void )
+static void remove_all_streams ( struct proxy_t *proxy )
 {
-    struct stream_t *iter = stream_list;
+    struct stream_t *iter;
     struct stream_t *next;
 
-    while ( iter )
+    for ( iter = proxy->stream_head; iter; iter = next )
     {
         next = iter->next;
-        remove_stream ( iter );
+        remove_stream ( proxy, iter );
         iter = next;
     }
-
-    stream_list = NULL;
 }
 
 /**
- * Remove unassociated relations
+ * Reduce streams count
  */
-static void clear_rels ( void )
+static void reduce_streams ( struct proxy_t *proxy )
 {
-    struct stream_t *iter = stream_list;
+    struct stream_t *iter;
 
-    while ( iter )
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
     {
-        if ( !iter->neighbour && ( iter->role == S_PORT_A || iter->role == S_PORT_B ) )
+        if ( ( iter->role == S_PORT_A || iter->role == S_PORT_B )
+            && iter->level != LEVEL_FORWARDING )
         {
-            remove_stream ( iter );
+            remove_relation ( iter );
         }
-        iter = iter->next;
     }
-
-#ifndef SILENT_MODE
-    show_stats (  );
-#endif
 }
 
 /**
- * Remove all forwarding relations
+ * Remove abandoned streams
  */
-static void empty_forwarding_rels ( void )
+static void cleanup_streams ( struct proxy_t *proxy )
 {
-    struct stream_t *iter = stream_list;
+    struct stream_t *iter;
     struct stream_t *next;
 
-    while ( iter )
+    for ( iter = proxy->stream_head; iter; iter = next )
     {
         next = iter->next;
-        if ( iter->role == S_PORT_A || iter->role == S_PORT_B )
+
+        if ( iter->abandoned )
         {
-            remove_stream ( iter );
+            remove_stream ( proxy, iter );
         }
-        iter = next;
+    }
+}
+
+/**
+ * Remove oldest forwarding relation
+ */
+static void force_cleanup ( struct proxy_t *proxy, const struct stream_t *excl )
+{
+    struct stream_t *iter;
+
+    for ( iter = proxy->stream_tail; iter; iter = iter->prev )
+    {
+        if ( iter != excl && iter->abandoned )
+        {
+            remove_relation ( iter );
+            remove_stream ( proxy, iter );
+            return;
+        }
     }
 
-    N ( printf ( "[ella] reset relations.\n" ) );
+    for ( iter = proxy->stream_tail; iter; iter = iter->prev )
+    {
+        if ( iter != excl && ( iter->role == S_PORT_A || iter->role == S_PORT_B ) )
+        {
+            remove_relation ( iter );
+            remove_stream ( proxy, iter );
+            return;
+        }
+    }
+}
+
+/**
+ * Build stream event list with poll
+ */
+static int build_poll_list ( struct proxy_t *proxy, struct pollfd *poll_list, size_t *poll_len )
+{
+    size_t poll_size;
+    size_t poll_rlen = 0;
+    struct stream_t *iter;
+    struct pollfd *pollref;
+
+    poll_size = *poll_len;
+
+    /* Reset poll references */
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
+    {
+        iter->pollref = NULL;
+    }
+
+    /* Append file descriptors to the poll list */
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
+    {
+        /* Assert poll list index */
+        if ( poll_rlen >= poll_size )
+        {
+            return -1;
+        }
+
+        /* Add stream to poll list if applicable */
+        if ( iter->events )
+        {
+            pollref = poll_list + poll_rlen;
+            pollref->fd = iter->fd;
+            pollref->events = POLLERR | POLLHUP | iter->events;
+            iter->pollref = pollref;
+            poll_rlen++;
+        }
+    }
+
+    *poll_len = poll_rlen;
+
+    return 0;
+}
+
+/**
+ * Update streams revents with poll
+ */
+static void update_revents_poll ( struct proxy_t *proxy )
+{
+    struct stream_t *iter;
+
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
+    {
+        iter->revents = iter->pollref ? iter->pollref->revents : 0;
+    }
+}
+
+/**
+ * Watch stream events with poll
+ */
+static int watch_streams_poll ( struct proxy_t *proxy )
+{
+    int nfds;
+    size_t poll_len;
+    struct pollfd poll_list[POOL_SIZE];
+
+    /* Set poll list size */
+    poll_len = sizeof ( poll_list ) / sizeof ( struct pollfd );
+
+    /* Rebuild poll event list */
+    if ( build_poll_list ( proxy, poll_list, &poll_len ) < 0 )
+    {
+        S ( printf ( "[vsck] poll build failed: %i\n", errno ) );
+        return -1;
+    }
+
+    /* Poll events */
+    if ( ( nfds = poll ( poll_list, poll_len, POLL_TIMEOUT_MSEC ) ) < 0 )
+    {
+        S ( printf ( "[vsck] poll failed: %i\n", errno ) );
+        return -1;
+    }
+
+    /* Update stream poll revents */
+    update_revents_poll ( proxy );
+
+    return nfds;
+}
+
+/**
+ * Convert poll to epoll events
+ */
+static int poll_to_epoll_events ( int poll_events )
+{
+    int epoll_events = 0;
+
+    if ( poll_events & POLLERR )
+    {
+        epoll_events |= EPOLLERR;
+    }
+
+    if ( poll_events & POLLHUP )
+    {
+        epoll_events |= EPOLLHUP;
+    }
+
+    if ( poll_events & POLLIN )
+    {
+        epoll_events |= EPOLLIN;
+    }
+
+    if ( poll_events & POLLOUT )
+    {
+        epoll_events |= EPOLLOUT;
+    }
+
+    return epoll_events;
+}
+
+/**
+ * Convert epoll to poll events
+ */
+static int epoll_to_poll_events ( int epoll_events )
+{
+    int poll_events = 0;
+
+    if ( epoll_events & EPOLLERR )
+    {
+        poll_events |= POLLERR;
+    }
+
+    if ( epoll_events & EPOLLHUP )
+    {
+        poll_events |= POLLHUP;
+    }
+
+    if ( epoll_events & EPOLLIN )
+    {
+        poll_events |= POLLIN;
+    }
+
+    if ( epoll_events & EPOLLOUT )
+    {
+        poll_events |= POLLOUT;
+    }
+
+    return epoll_events;
+}
+
+/**
+ * Build stream event list with epoll
+ */
+static int build_epoll_list ( struct proxy_t *proxy )
+{
+    int operation;
+    struct stream_t *iter;
+    struct epoll_event event;
+
+    /* Append file descriptors to the poll list */
+    for ( iter = proxy->stream_head; iter; iter = iter->next )
+    {
+        if ( iter->events )
+        {
+            if ( !iter->pollref || iter->events != iter->levents )
+            {
+                event.data.ptr = iter;
+                event.events = poll_to_epoll_events ( iter->events | POLLERR | POLLHUP );
+                operation = iter->pollref ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+
+                if ( epoll_ctl ( proxy->epoll_fd, operation, iter->fd, &event ) < 0 )
+                {
+                    return -1;
+                }
+
+                iter->levents = iter->events;
+                iter->pollref = EPOLLREF;
+            }
+
+        } else if ( iter->pollref )
+        {
+            if ( epoll_ctl ( proxy->epoll_fd, EPOLL_CTL_DEL, iter->fd, NULL ) < 0 )
+            {
+                return -1;
+            }
+
+            iter->pollref = NULL;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Update streams revents with poll
+ */
+static void update_revents_epoll ( struct proxy_t *proxy, int nfds, struct epoll_event *events )
+{
+    int i;
+    struct stream_t *stream;
+
+    for ( stream = proxy->stream_head; stream; stream = stream->next )
+    {
+        stream->revents = 0;
+    }
+
+    for ( i = 0; i < nfds; i++ )
+    {
+        if ( ( stream = events[i].data.ptr ) )
+        {
+            stream->revents = epoll_to_poll_events ( events[i].events );
+        }
+    }
+}
+
+/**
+ * Watch stream events with epoll
+ */
+static int watch_streams_epoll ( struct proxy_t *proxy )
+{
+    int nfds;
+    struct epoll_event events[POOL_SIZE];
+
+    /* Rebuild epoll event list */
+    if ( build_epoll_list ( proxy ) < 0 )
+    {
+        S ( printf ( "[vsck] poll build failed: %i\n", errno ) );
+        return -1;
+    }
+
+    /* E-Poll events */
+    if ( ( nfds = epoll_wait ( proxy->epoll_fd, events, POOL_SIZE, POLL_TIMEOUT_MSEC ) ) < 0 )
+    {
+        S ( printf ( "[vsck] poll failed: %i\n", errno ) );
+        return -1;
+    }
+
+    /* Update stream epoll revents */
+    update_revents_epoll ( proxy, nfds, events );
+
+    return nfds;
+}
+
+/**
+ * Watch stream events
+ */
+static int watch_streams ( struct proxy_t *proxy )
+{
+    if ( proxy->epoll_fd >= 0 )
+    {
+        return watch_streams_epoll ( proxy );
+    }
+
+    return watch_streams_poll ( proxy );
+}
+
+/**
+ * Estabilish connection with endpoint
+ */
+static int setup_endpoint_stream ( struct proxy_t *proxy, struct stream_t *stream,
+    unsigned int addr, unsigned short port )
+{
+    int sock;
+    struct sockaddr_in saddr;
+    struct stream_t *neighbour;
+
+    /* Prepare socket address */
+    memset ( &saddr, '\0', sizeof ( saddr ) );
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = addr;
+    saddr.sin_port = htons ( port );
+
+    /* Create new socket */
+    if ( ( sock = socket ( AF_INET, SOCK_STREAM, 0 ) ) < 0 )
+    {
+        return -2;
+    }
+
+    /* Set non-blocking mode on socket */
+    if ( socket_set_nonblocking ( sock ) < 0 )
+    {
+        shutdown_then_close ( sock );
+        return -1;
+    }
+
+    /* Asynchronous connect endpoint */
+    if ( connect ( sock, ( struct sockaddr * ) &saddr, sizeof ( struct sockaddr_in ) ) >= 0 )
+    {
+        shutdown_then_close ( sock );
+        return -1;
+    }
+
+    /* Connecting should be in progress */
+    if ( errno != EINPROGRESS )
+    {
+        shutdown_then_close ( sock );
+        return -1;
+    }
+
+    /* Check for socket error */
+    if ( socket_has_error ( sock ) )
+    {
+        shutdown_then_close ( sock );
+        return -1;
+    }
+
+    /* Try allocating neighbour stream */
+    if ( !( neighbour = insert_stream ( proxy, sock ) ) )
+    {
+        force_cleanup ( proxy, stream );
+        neighbour = insert_stream ( proxy, sock );
+    }
+
+    /* Check for neighbour stream */
+    if ( !neighbour )
+    {
+        shutdown_then_close ( sock );
+        return -2;
+    }
+
+    /* Set neighbour role */
+    neighbour->role = S_PORT_B;
+    neighbour->level = LEVEL_CONNECTING;
+    neighbour->events = POLLIN | POLLOUT;
+
+    /* Build up a new relation */
+    neighbour->neighbour = stream;
+    stream->neighbour = neighbour;
+
+    return 0;
 }
 
 /**
  * Create a new stream
  */
-static int new_stream ( int lfd, int role )
+static struct stream_t *accept_new_stream ( struct proxy_t *proxy, int lfd )
 {
     int sock;
     struct stream_t *stream;
@@ -317,87 +693,68 @@ static int new_stream ( int lfd, int role )
     /* Accept incoming connection */
     if ( ( sock = accept ( lfd, NULL, NULL ) ) < 0 )
     {
-        return -1;
+        return NULL;
     }
 
-    /* Allocate new stream */
-    if ( !( stream = insert_stream ( role, sock ) ) )
+    /* Set non-blocking mode on socket */
+    if ( socket_set_nonblocking ( sock ) < 0 )
     {
-        return -1;
+        shutdown_then_close ( sock );
+        return NULL;
     }
 
-    /* Perform additional actions if needed */
-    if ( role == S_PORT_A )
+    /* Try allocating new stream */
+    if ( !( stream = insert_stream ( proxy, sock ) ) )
     {
-        stream->level = LEVEL_AWAITING;
+        force_cleanup ( proxy, NULL );
+        stream = insert_stream ( proxy, sock );
     }
 
-    return 0;
+    /* Check if stream was allocated */
+    if ( !stream )
+    {
+        shutdown_then_close ( sock );
+        return NULL;
+    }
+
+    return stream;
 }
 
 /**
- * Rebuild poll event list
+ * Handle new stream creation
  */
-static int poll_rebuild ( void )
+static int handle_new_stream ( struct proxy_t *proxy, struct stream_t *stream )
 {
-    struct stream_t *iter = stream_list;
+    int status;
+    unsigned int addr;
+    unsigned short port;
+    struct stream_t *util;
 
-    /* Append file descriptors to the poll list */
-    for ( poll_len = 0; iter; iter = iter->next )
-    {
-        /* Skip port A select on level connect */
-        if ( iter->role == S_PORT_A && iter->level == LEVEL_CONNECT )
-        {
-            iter->polled = 0;
-            continue;
-        }
-
-        /* Expand poll event list if needed */
-        if ( poll_len == poll_size && poll_expand (  ) < 0 )
-        {
-            return -1;
-        }
-
-        /* Append stream fd to poll event list if allowed */
-        poll_list[poll_len++].fd = iter->fd;
-        iter->polled = 1;
-    }
-
-    /* Poll event list is rebuilt by now */
-    poll_modified = 0;
-    return 0;
-}
-
-/**
- * Forward data from one socket to another
- */
-static int move_data ( int srcfd, int dstfd )
-{
-    size_t tot;
-    size_t len;
-    size_t sum;
-    unsigned char buffer[65536];
-
-    /* Receive data from input socket to buffer */
-    if ( ( ssize_t ) ( tot = recv ( srcfd, buffer, sizeof ( buffer ), 0 ) ) < 0 )
+    if ( ~stream->revents & POLLIN )
     {
         return -1;
     }
 
-    /* Abort if receive length is zero */
-    if ( !tot )
+    /* Accept incoming connection */
+    if ( !( util = accept_new_stream ( proxy, stream->fd ) ) )
     {
-        errno = EPIPE;
-        return -1;
+        return -2;
     }
 
-    /* Send complete data from buffer to output socket */
-    for ( sum = 0; sum < tot; sum += len )
+    /* Setup new stream */
+    util->role = S_PORT_A;
+    util->level = LEVEL_AWAITING;
+    util->events = 0;
+
+    /* Set endpoint address */
+    addr = proxy->endpoint_addr;
+    port = proxy->endpoint_port;
+
+    /* Setup endpoint stream */
+    if ( ( status = setup_endpoint_stream ( proxy, util, addr, port ) ) < 0 )
     {
-        if ( ( ssize_t ) ( len = send ( dstfd, buffer + sum, tot - sum, MSG_NOSIGNAL ) ) < 0 )
-        {
-            return -1;
-        }
+        remove_stream ( proxy, util );
+        return status;
     }
 
     return 0;
@@ -406,13 +763,17 @@ static int move_data ( int srcfd, int dstfd )
 /**
  * Format IP address to string
  */
-static void ipstr ( unsigned int addr, char *buffer, size_t size )
+static void inet_ntoa_s ( unsigned int addr, char *buffer, size_t size )
 {
-    /* Format string from input IPv4 address */
-    snprintf ( buffer, size, "%d.%d.%d.%d",
-        ( ( unsigned char * ) &addr )[0],
-        ( ( unsigned char * ) &addr )[1],
-        ( ( unsigned char * ) &addr )[2], ( ( unsigned char * ) &addr )[3] );
+    union
+    {
+        unsigned int value;
+        unsigned char array[4];
+    } u;
+
+    u.value = addr;
+
+    snprintf ( buffer, size, "%d.%d.%d.%d", u.array[0], u.array[1], u.array[2], u.array[3] );
 }
 
 /**
@@ -439,291 +800,395 @@ static int get_original_dest ( int sock, unsigned int *addr, unsigned short *por
     *port = ntohs ( saddr.sin_port );
 
     /* Format peer address */
-    ipstr ( *addr, straddr, sizeof ( straddr ) );
+    inet_ntoa_s ( *addr, straddr, sizeof ( straddr ) );
 
     /* Print remote target */
-    printf ( "[ella] forwarding to %s:%u ...\n", straddr, ( unsigned int ) *port );
+    S ( printf ( "[vsck] forwarding to %s:%u ...\n", straddr, ( unsigned int ) *port ) );
 
     return 0;
 }
 
 /**
- * Estabilish connection with destination host
+ * Handle stream socks handshake and request
  */
-static int connect_endpoint ( const struct ella_params_t *params, struct stream_t *stream )
+static int handle_stream_socks ( struct stream_t *stream )
 {
-    int sock;
-    ssize_t len;
-    unsigned int remote_addr;
-    unsigned short remote_port;
-    struct sockaddr_in saddr;
-    struct stream_t *neighbour;
-    unsigned char buffer[2048];
-
-    /* Obtain original destination */
-    if ( get_original_dest ( stream->fd, &remote_addr, &remote_port ) < 0 )
+    unsigned short port;
+    union
     {
+        unsigned int addr;
+        unsigned char paddr[4];
+    } u;
+    size_t len;
+    unsigned char arr[2048];
+
+    switch ( stream->level )
+    {
+    case LEVEL_CONNECTING:
+        if ( stream->revents & POLLOUT )
+        {
+            /* Send version */
+            arr[0] = 5;
+            arr[1] = 1;
+            arr[2] = 0;
+            if ( queue_push ( &stream->queue, arr, 3 ) < 0 )
+            {
+                return -1;
+            }
+            stream->level = LEVEL_SOCKS_VER;
+            stream->events = POLLOUT;
+        }
+        break;
+    case LEVEL_SOCKS_VER:
+        if ( stream->revents & POLLIN )
+        {
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 2 )
+            {
+                return -1;
+            }
+            /* Check for error */
+            if ( arr[0] != 5 || arr[1] != 0 )
+            {
+                return -1;
+            }
+            /* Get destiantion host and port */
+            if ( get_original_dest ( stream->neighbour->fd, &u.addr, &port ) < 0 )
+            {
+                return -1;
+            }
+            /* Verify endpoint port */
+            if ( HTTPS_TRAFFIC_ONLY && port != 443 )
+            {
+                S ( printf ( "[vsck] port %i is restricted.\n", port ) );
+                return -1;
+            }
+            /* Send request */
+            arr[0] = 5; /* connect request */
+            arr[1] = 1; /* tcp/ip stream */
+            arr[2] = 0; /* reserved */
+            arr[3] = 1; /* connect ipv4 */
+            arr[4] = u.paddr[0];        /* ip 1st byte */
+            arr[5] = u.paddr[1];        /* ip 2nd byte */
+            arr[6] = u.paddr[2];        /* ip 3rd byte */
+            arr[7] = u.paddr[3];        /* ip 4th byte */
+            arr[8] = port >> 8; /* port 1st byte */
+            arr[9] = port & 0xff;       /* port 2nd byte */
+            if ( queue_push ( &stream->queue, arr, 10 ) < 0 )
+            {
+                return -1;
+            }
+            stream->level = LEVEL_SOCKS_PASS;
+            stream->events = POLLOUT;
+        }
+        break;
+    case LEVEL_SOCKS_PASS:
+        if ( stream->revents & POLLIN )
+        {
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 4 )
+            {
+                return -1;
+            }
+            /* Check for error */
+            if ( arr[0] != 5 || arr[1] != 0 || arr[3] != 1 )
+            {
+                return -1;
+            }
+            stream->level = LEVEL_FORWARDING;
+            stream->events = POLLIN;
+            stream->neighbour->level = LEVEL_FORWARDING;
+            stream->neighbour->events = POLLIN;
+        }
+        break;
+    default:
         return -1;
     }
-
-    /* Prepare socket address */
-    memset ( &saddr, '\0', sizeof ( saddr ) );
-    saddr.sin_family = AF_INET;
-    saddr.sin_addr.s_addr = params->socks_addr;
-    saddr.sin_port = htons ( params->socks_port );
-
-    /* Allocate socket */
-    if ( ( sock = socket ( AF_INET, SOCK_STREAM, 0 ) ) < 0 )
-    {
-        return -1;
-    }
-
-    /* Connect to SOCKS Proxy */
-    if ( connect ( sock, ( struct sockaddr * ) &saddr, sizeof ( struct sockaddr_in ) ) < 0 )
-    {
-    	close(sock);
-        return -1;
-    }
-
-    /* Version 5, one method: no authentication */
-    buffer[0] = 5;      /* socks version */
-    buffer[1] = 1;      /* one method */
-    buffer[2] = 0;      /* no auth */
-
-    /* Estabilish session with proxy server */
-    if ( send ( sock, buffer, 3, MSG_NOSIGNAL ) <= 0 )
-    {
-        close ( sock );
-        return -1;
-    }
-
-    /* Receive operation status */
-    if ( ( len = recv ( sock, buffer, sizeof ( buffer ) - 1, 0 ) ) <= 0 )
-    {
-        close ( sock );
-        return -1;
-    }
-
-    /* Analyse received response */
-    if ( len != 2 || buffer[0] != 5 || buffer[1] != 0 )
-    {
-        close ( sock );
-        return -1;
-    }
-
-    /* Version 5, one method: no authentication */
-    buffer[0] = 5;      /* socks version */
-    buffer[1] = 1;      /* connect */
-    buffer[2] = 0;      /* reserved */
-    buffer[3] = 1;      /* IPv4 address type */
-
-    /* IP address 1'st - 4'th byte */
-    memcpy ( buffer + 4, &remote_addr, sizeof ( unsigned int ) );
-
-    /* Port number 1'st - 2'nd byte */
-    remote_port = htons ( remote_port );
-    memcpy ( buffer + 8, &remote_port, sizeof ( unsigned short ) );
-
-    /* Send request to SOCK5 proxy server */
-    if ( send ( sock, buffer, 10, MSG_NOSIGNAL ) <= 0 )
-    {
-        close ( sock );
-        return -1;
-    }
-
-    /* Allocate new neighbour structure */
-    if ( !( neighbour = insert_stream ( S_PORT_B, sock ) ) )
-    {
-        close ( sock );
-        return -1;
-    }
-
-    /* Build up a new relation */
-    neighbour->neighbour = stream;
-    stream->neighbour = neighbour;
-
-    /* Shift relation level */
-    neighbour->level = LEVEL_CONNECT;
-    stream->level = LEVEL_CONNECT;
 
     return 0;
 }
 
 /**
- * Finish asynchronous connect process
+ * Forward data between sockets
  */
-static int complete_connect ( struct stream_t *stream )
+static int socket_forward_data ( int srcfd, int dstfd )
 {
-    int so_error = 0;
-    long mode = 0;
-    socklen_t len = sizeof ( so_error );
-    unsigned char buffer[2048];
+    int len = FORWARD_CHUNK_LEN;
+    int recvlim;
+    int sendlim;
+    int sendwip;
+    socklen_t optlen;
+    unsigned char buffer[FORWARD_CHUNK_LEN];
 
-    /* Neighbour must be present */
-    if ( !stream->neighbour )
+    if ( ioctl ( srcfd, FIONREAD, &recvlim ) < 0 )
     {
         return -1;
     }
 
-    /* Read and analyze socket error */
-    if ( getsockopt ( stream->fd, SOL_SOCKET, SO_ERROR, &so_error, &len ) < 0 || so_error )
+    if ( !recvlim )
     {
         return -1;
     }
 
-    /* Restore blocking mode on socket */
-    if ( ( mode = fcntl ( stream->fd, F_GETFL, 0 ) ) < 0
-        || fcntl ( stream->fd, F_SETFL, mode & ( ~O_NONBLOCK ) ) < 0 )
+    if ( recvlim < len )
+    {
+        len = recvlim;
+    }
+
+    if ( ioctl ( dstfd, TIOCOUTQ, &sendwip ) < 0 )
     {
         return -1;
     }
 
-    /* Receive operation status */
-    if ( ( len = recv ( stream->fd, buffer, sizeof ( buffer ) - 1, 0 ) ) <= 0 )
+    optlen = sizeof ( sendlim );
+
+    if ( getsockopt ( dstfd, SOL_SOCKET, SO_SNDBUF, &sendlim, &optlen ) < 0 )
     {
         return -1;
     }
 
-    /* Analyse received response */
-    if ( len < 4 || buffer[0] != 5 || buffer[1] != 0 || buffer[3] != 1 )
+    if ( optlen != sizeof ( sendlim ) )
     {
         return -1;
     }
 
-    /* Shift relation level */
-    stream->level = LEVEL_FORWARD;
-    stream->neighbour->level = LEVEL_FORWARD;
-    poll_modified = 1;
+    if ( sendwip > sendlim )
+    {
+        return -1;
+    }
+
+    sendlim -= sendwip;
+
+    if ( !sendlim )
+    {
+        return -1;
+    }
+
+    if ( sendlim < len )
+    {
+        len = sendlim;
+    }
+
+    if ( !len )
+    {
+        return -1;
+    }
+
+    if ( recv ( srcfd, buffer, len, MSG_PEEK ) < len )
+    {
+        return -1;
+    }
+
+    if ( ( len = send ( dstfd, buffer, len, MSG_NOSIGNAL ) ) < 0 )
+    {
+        return -1;
+    }
+
+    if ( recv ( srcfd, buffer, len, 0 ) < len )
+    {
+        return -1;
+    }
+
+    return len;
+}
+
+/**
+ * Handle stream data forward
+ */
+static int handle_forward_data ( struct stream_t *stream )
+{
+    int len;
+    if ( !stream->neighbour || stream->level != LEVEL_FORWARDING )
+    {
+        return -1;
+    }
+
+    if ( stream->revents & POLLOUT )
+    {
+        if ( ( len = socket_forward_data ( stream->neighbour->fd, stream->fd ) ) < 0 )
+        {
+            return -1;
+        }
+
+        stream->events &= ~POLLOUT;
+        stream->neighbour->events |= POLLIN;
+
+    } else if ( stream->revents & POLLIN )
+    {
+        stream->events &= ~POLLIN;
+        stream->neighbour->events |= POLLOUT;
+    }
 
     return 0;
 }
 
 /**
- * Proxy data forward loop
+ * Handle stream events
  */
-static void poll_loop ( const struct ella_params_t *params )
+static int handle_stream_events ( struct proxy_t *proxy, struct stream_t *stream )
 {
     int status;
-    size_t pos = 0;
-    struct stream_t *stream;
 
-    /* Rebuild poll event list if needed */
-    if ( poll_modified && poll_rebuild (  ) < 0 )
+    if ( handle_forward_data ( stream ) >= 0 )
     {
-        N ( printf ( "[ella] rebuild failed: %i\n", errno ) );
-        exit_flag = 1;
-        return;
+        return 0;
     }
 
-    /* Find streams ready to be read */
-    if ( ( status = poll ( poll_list, poll_len, POLL_TIMEOUT_MSEC ) ) < 0 )
+    if ( stream->role == S_PORT_B && stream->queue.len && ( stream->revents & POLLOUT ) )
     {
-        N ( printf ( "[ella] poll failed: %i\n", errno ) );
-        exit_flag = 1;
-        return;
+        if ( queue_shift ( &stream->queue, stream->fd ) < 0 )
+        {
+            remove_relation ( stream );
+            return 0;
+        }
+        if ( stream->queue.len == 0 )
+        {
+            stream->events = POLLIN;
+        }
+        return 0;
     }
 
-    /* Clear unassociated relations on timeout */
+    switch ( stream->role )
+    {
+    case L_ACCEPT:
+        S ( show_stats ( proxy ) );
+        if ( handle_new_stream ( proxy, stream ) == -2 )
+        {
+            return -1;
+        }
+        return 0;
+    case S_PORT_B:
+        if ( ( status = handle_stream_socks ( stream ) ) >= 0 )
+        {
+            return 0;
+        }
+        break;
+    }
+
+    remove_relation ( stream );
+
+    return 0;
+}
+
+/**
+ * Stream event handling cycle
+ */
+static int handle_streams_cycle ( struct proxy_t *proxy )
+{
+    int status;
+    struct stream_t *iter;
+    struct stream_t *next;
+
+    /* Cleanup streams */
+    cleanup_streams ( proxy );
+
+    /* Watch streams events */
+    if ( ( status = watch_streams ( proxy ) ) < 0 )
+    {
+        S ( printf ( "[vsck] event watch failed: %i\n", errno ) );
+        return -1;
+    }
+
+    /* Reduce streams count */
     if ( !status )
     {
-        clear_rels (  );
-        return;
+        reduce_streams ( proxy );
+        cleanup_streams ( proxy );
+        S ( show_stats ( proxy ) );
+        return 0;
     }
 
-    /* Forward data or accept peers if needed */
-    for ( stream = stream_list; stream; stream = stream->next )
+    /* Process stream list */
+    for ( iter = proxy->stream_head; iter; iter = next )
     {
-        if ( !stream->polled )
-        {
-            continue;
-        }
+        next = iter->next;
 
-        if ( ~poll_list[pos++].revents & POLLIN )
+        if ( !iter->abandoned && iter->revents )
         {
-            continue;
-        }
-
-        if ( stream->role == S_PORT_B && stream->level == LEVEL_CONNECT )
-        {
-            if ( complete_connect ( stream ) < 0 )
+            if ( iter->revents & ( POLLERR | POLLHUP ) )
             {
-                remove_relation ( stream );
-            }
-            return;
-        }
+                remove_relation ( iter );
 
-        if ( stream->role == L_ACCEPT )
-        {
-            if ( new_stream ( stream->fd, S_PORT_A ) < 0 )
+            } else
             {
-                empty_forwarding_rels (  );
-                return;
-            }
-
-        } else if ( stream->role == S_PORT_A && stream->level == LEVEL_AWAITING )
-        {
-            if ( connect_endpoint ( params, stream ) < 0 )
-            {
-                remove_relation ( stream );
-                return;
-            }
-
-        } else if ( stream->level == LEVEL_FORWARD && stream->neighbour )
-        {
-            if ( move_data ( stream->fd, stream->neighbour->fd ) < 0 )
-            {
-                remove_relation ( stream );
-                return;
+                if ( handle_stream_events ( proxy, iter ) < 0 )
+                {
+                    return -1;
+                }
             }
         }
     }
+
+    return 0;
 }
 
 /**
  * Proxy task entry point
  */
-int proxy_task ( const struct ella_params_t *params )
+int proxy_task ( struct proxy_t *proxy )
 {
-    size_t i;
+    int status = 0;
+    int sock;
+    struct stream_t *stream;
 
-    /* Setup listen sockets */
-    if ( listen_socket ( params->listen_addr, params->listen_port, L_ACCEPT ) < 0 )
+    /* Reset current state */
+    proxy->stream_head = NULL;
+    proxy->stream_tail = NULL;
+    memset ( proxy->stream_pool, '\0', sizeof ( proxy->stream_pool ) );
+
+    /* Create epoll fd if possible */
+    if ( ( proxy->epoll_fd = epoll_create1 ( 0 ) ) >= 0 )
     {
-        N ( printf ( "[ella] allocation failed: %i\n", errno ) );
+        S ( printf ( "[vsck] epoll initialized.\n" ) );
+
+    } else
+    {
+        S ( printf ( "[vsck] epoll not supported.\n" ) );
+    }
+
+    /* Setup listen socket */
+    if ( ( sock = listen_socket ( proxy->listen_addr, proxy->listen_port ) ) < 0 )
+    {
+        S ( printf ( "[vsck] bind socket failed: %i\n", errno ) );
+        if ( proxy->epoll_fd >= 0 )
+        {
+            close ( proxy->epoll_fd );
+        }
         return -1;
     }
 
-    /* Allocate poll event list */
-#ifndef STATIC_POOL
-    if ( !( poll_list = ( struct pollfd * ) malloc ( poll_size * sizeof ( struct pollfd ) ) ) )
+    /* Allocate new stream */
+    if ( !( stream = insert_stream ( proxy, sock ) ) )
     {
+        shutdown_then_close ( sock );
+        if ( proxy->epoll_fd >= 0 )
+        {
+            close ( proxy->epoll_fd );
+        }
         return -1;
     }
-#endif
 
-    /* Prepare poll event list */
-    for ( i = 0; i < poll_size; i++ )
+    /* Update listen stream */
+    stream->role = L_ACCEPT;
+    stream->events = POLLIN;
+
+    S ( printf ( "[vsck] setup successful.\n" ) );
+
+    /* Run forward loop */
+    while ( ( status = handle_streams_cycle ( proxy ) ) >= 0 );
+
+    /* Do not close reset pipe */
+    stream->fd = -1;
+
+    /* Remove all streams */
+    remove_all_streams ( proxy );
+
+    /* Close epoll fd if created */
+    if ( proxy->epoll_fd >= 0 )
     {
-        poll_list[i].events = POLLIN;
+        close ( proxy->epoll_fd );
+        proxy->epoll_fd = -1;
     }
 
-    N ( printf ( "[ella] allocation done.\n" ) );
+    S ( printf ( "[vsck] free done.\n" ) );
 
-    /* Perform select loop until exit flag is set */
-    while ( !exit_flag )
-    {
-        poll_loop ( params );
-    }
-
-    /* Remove all relations */
-    empty_rels (  );
-
-    /* Free poll event list */
-#ifndef STATIC_POOL
-    free ( poll_list );
-#endif
-
-    N ( printf ( "[ella] free done.\n" ) );
-
-    return 0;
+    return status;
 }
