@@ -61,8 +61,11 @@ struct proxy_t
     unsigned int listen_addr;
     unsigned short listen_port;
 
-    unsigned int endpoint_addr;
-    unsigned short endpoint_port;
+    unsigned int socks5_addr;
+    unsigned short socks5_port;
+
+    unsigned int dest_addr;
+    unsigned short dest_port;
 
     struct stream_t *stream_head;
     struct stream_t *stream_tail;

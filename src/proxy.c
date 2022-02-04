@@ -747,8 +747,8 @@ static int handle_new_stream ( struct proxy_t *proxy, struct stream_t *stream )
     util->events = 0;
 
     /* Set endpoint address */
-    addr = proxy->endpoint_addr;
-    port = proxy->endpoint_port;
+    addr = proxy->socks5_addr;
+    port = proxy->socks5_port;
 
     /* Setup endpoint stream */
     if ( ( status = setup_endpoint_stream ( proxy, util, addr, port ) ) < 0 )
@@ -811,7 +811,7 @@ static int get_original_dest ( int sock, unsigned int *addr, unsigned short *por
 /**
  * Handle stream socks handshake and request
  */
-static int handle_stream_socks ( struct stream_t *stream )
+static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream )
 {
     unsigned short port;
     union
@@ -852,7 +852,12 @@ static int handle_stream_socks ( struct stream_t *stream )
                 return -1;
             }
             /* Get destiantion host and port */
-            if ( get_original_dest ( stream->neighbour->fd, &u.addr, &port ) < 0 )
+            if ( proxy->dest_addr )
+            {
+                u.addr = proxy->dest_addr;
+                port = proxy->dest_port;
+
+            } else if ( get_original_dest ( stream->neighbour->fd, &u.addr, &port ) < 0 )
             {
                 return -1;
             }
@@ -1056,7 +1061,7 @@ static int handle_stream_events ( struct proxy_t *proxy, struct stream_t *stream
         }
         return 0;
     case S_PORT_B:
-        if ( ( status = handle_stream_socks ( stream ) ) >= 0 )
+        if ( ( status = handle_stream_socks ( proxy, stream ) ) >= 0 )
         {
             return 0;
         }
@@ -1135,7 +1140,7 @@ int proxy_task ( struct proxy_t *proxy )
     memset ( proxy->stream_pool, '\0', sizeof ( proxy->stream_pool ) );
 
     /* Create epoll fd if possible */
-    if ( ( proxy->epoll_fd = epoll_create1 ( 0 ) ) >= 0 )
+    if ( ( proxy->epoll_fd = epoll_create ( 0 ) ) >= 0 )
     {
         S ( printf ( "[vsck] epoll initialized.\n" ) );
 

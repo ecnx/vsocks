@@ -9,12 +9,14 @@
  */
 static void show_usage ( void )
 {
-    S ( printf ( "[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port\n"
-            "\n"
-            "       listen-addr       Gateway address\n"
+    S ( printf
+        ( "[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [dest-addr:dest-port]\n"
+            "\n" "       listen-addr       Gateway address\n"
             "       listen-port       Gateway port\n"
             "       socks5-addr       Socks server address\n"
-            "       socks5-port       Socks-5 server port\n\n" ) );
+            "       socks5-port       Socks-5 server port\n"
+            "       dest-addr         Destination address\n"
+            "       dest-port         Destination port\n\n" ) );
 }
 
 /**
@@ -72,7 +74,7 @@ int main ( int argc, char *argv[] )
     S ( printf ( "[vsck] VSocks - ver. " VSOCKS_VERSION "\n" ) );
 
     /* Validate arguments count */
-    if ( argc != 3 )
+    if ( argc < 3 )
     {
         show_usage (  );
         return 1;
@@ -86,11 +88,21 @@ int main ( int argc, char *argv[] )
         return 1;
     }
 
-    if ( ip_port_decode ( argv[2], &proxy.endpoint_addr, &proxy.endpoint_port ) < 0 )
+    if ( ip_port_decode ( argv[2], &proxy.socks5_addr, &proxy.socks5_port ) < 0 )
     {
         show_usage (  );
         return 1;
     }
+
+    if ( argc > 3 )
+    {
+        if ( ip_port_decode ( argv[3], &proxy.dest_addr, &proxy.dest_port ) < 0 )
+        {
+            show_usage (  );
+            return 1;
+        }
+    }
+
 #ifndef VERBOSE_MODE
     if ( daemon ( 0, 0 ) < 0 )
     {
