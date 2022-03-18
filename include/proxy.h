@@ -18,6 +18,11 @@
 #define LEVEL_SOCKS_VER             3
 #define LEVEL_SOCKS_REQ             4
 #define LEVEL_SOCKS_PASS            5
+
+#define LEVEL_SOCKS_VER_2           7
+#define LEVEL_SOCKS_REQ_2           8
+#define LEVEL_SOCKS_PASS_2          9
+
 #define LEVEL_FORWARDING            6
 
 #define EPOLLREF                    ((struct pollfd*) -1)
@@ -64,6 +69,7 @@ struct proxy_t
     unsigned int socks5_addr;
     unsigned short socks5_port;
 
+    int use_second_handshake;
     unsigned int dest_addr;
     unsigned short dest_port;
 

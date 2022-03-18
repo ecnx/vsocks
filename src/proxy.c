@@ -255,7 +255,7 @@ static void show_stats ( struct proxy_t *proxy )
         total++;
     }
 
-    S ( printf ( "[vsck] load: A:%i/%i B:%i/%i *:%i/%i\n", a_forwarding, a_total, b_forwarding,
+    V ( printf ( "[vsck] load: A:%i/%i B:%i/%i *:%i/%i\n", a_forwarding, a_total, b_forwarding,
             b_total, total, POOL_SIZE ) );
 }
 #endif
@@ -423,14 +423,14 @@ static int watch_streams_poll ( struct proxy_t *proxy )
     /* Rebuild poll event list */
     if ( build_poll_list ( proxy, poll_list, &poll_len ) < 0 )
     {
-        S ( printf ( "[vsck] poll build failed: %i\n", errno ) );
+        V ( printf ( "[vsck] poll build failed: %i\n", errno ) );
         return -1;
     }
 
     /* Poll events */
     if ( ( nfds = poll ( poll_list, poll_len, POLL_TIMEOUT_MSEC ) ) < 0 )
     {
-        S ( printf ( "[vsck] poll failed: %i\n", errno ) );
+        V ( printf ( "[vsck] poll failed: %i\n", errno ) );
         return -1;
     }
 
@@ -576,14 +576,14 @@ static int watch_streams_epoll ( struct proxy_t *proxy )
     /* Rebuild epoll event list */
     if ( build_epoll_list ( proxy ) < 0 )
     {
-        S ( printf ( "[vsck] poll build failed: %i\n", errno ) );
+        V ( printf ( "[vsck] poll build failed: %i\n", errno ) );
         return -1;
     }
 
     /* E-Poll events */
     if ( ( nfds = epoll_wait ( proxy->epoll_fd, events, POOL_SIZE, POLL_TIMEOUT_MSEC ) ) < 0 )
     {
-        S ( printf ( "[vsck] poll failed: %i\n", errno ) );
+        V ( printf ( "[vsck] poll failed: %i\n", errno ) );
         return -1;
     }
 
@@ -803,7 +803,7 @@ static int get_original_dest ( int sock, unsigned int *addr, unsigned short *por
     inet_ntoa_s ( *addr, straddr, sizeof ( straddr ) );
 
     /* Print remote target */
-    S ( printf ( "[vsck] forwarding to %s:%u ...\n", straddr, ( unsigned int ) *port ) );
+    V ( printf ( "[vsck] forwarding to %s:%u ...\n", straddr, ( unsigned int ) *port ) );
 
     return 0;
 }
@@ -852,7 +852,7 @@ static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream 
                 return -1;
             }
             /* Get destiantion host and port */
-            if ( proxy->dest_addr )
+            if ( proxy->dest_addr || proxy->use_second_handshake )
             {
                 u.addr = proxy->dest_addr;
                 port = proxy->dest_port;
@@ -864,7 +864,7 @@ static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream 
             /* Verify endpoint port */
             if ( HTTPS_TRAFFIC_ONLY && port != 443 )
             {
-                S ( printf ( "[vsck] port %i is restricted.\n", port ) );
+                V ( printf ( "[vsck] port %i is restricted.\n", port ) );
                 return -1;
             }
             /* Send request */
@@ -887,6 +887,78 @@ static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream 
         }
         break;
     case LEVEL_SOCKS_PASS:
+        if ( stream->revents & POLLIN )
+        {
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 4 )
+            {
+                return -1;
+            }
+
+            /* Check for error */
+            if ( arr[0] != 5 || arr[1] != 0 || arr[3] != 1 )
+            {
+                return -1;
+            }
+
+            if ( proxy->use_second_handshake )
+            {
+                /* Send version */
+                arr[0] = 5;
+                arr[1] = 1;
+                arr[2] = 0;
+                if ( queue_push ( &stream->queue, arr, 3 ) < 0 )
+                {
+                    return -1;
+                }
+                stream->level = LEVEL_SOCKS_VER_2;
+                stream->events = POLLOUT;
+
+            } else
+            {
+                stream->level = LEVEL_FORWARDING;
+                stream->events = POLLIN;
+                stream->neighbour->level = LEVEL_FORWARDING;
+                stream->neighbour->events = POLLIN;
+            }
+        }
+        break;
+    case LEVEL_SOCKS_VER_2:
+        if ( stream->revents & POLLIN )
+        {
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 2 )
+            {
+                return -1;
+            }
+            /* Check for error */
+            if ( arr[0] != 5 || arr[1] != 0 )
+            {
+                return -1;
+            }
+            /* Get destiantion host and port */
+            if ( get_original_dest ( stream->neighbour->fd, &u.addr, &port ) < 0 )
+            {
+                return -1;
+            }
+            /* Send request */
+            arr[0] = 5; /* connect request */
+            arr[1] = 1; /* tcp/ip stream */
+            arr[2] = 0; /* reserved */
+            arr[3] = 1; /* connect ipv4 */
+            arr[4] = u.paddr[0];        /* ip 1st byte */
+            arr[5] = u.paddr[1];        /* ip 2nd byte */
+            arr[6] = u.paddr[2];        /* ip 3rd byte */
+            arr[7] = u.paddr[3];        /* ip 4th byte */
+            arr[8] = port >> 8; /* port 1st byte */
+            arr[9] = port & 0xff;       /* port 2nd byte */
+            if ( queue_push ( &stream->queue, arr, 10 ) < 0 )
+            {
+                return -1;
+            }
+            stream->level = LEVEL_SOCKS_PASS_2;
+            stream->events = POLLOUT;
+        }
+        break;
+    case LEVEL_SOCKS_PASS_2:
         if ( stream->revents & POLLIN )
         {
             if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 4 )
@@ -1054,7 +1126,7 @@ static int handle_stream_events ( struct proxy_t *proxy, struct stream_t *stream
     switch ( stream->role )
     {
     case L_ACCEPT:
-        S ( show_stats ( proxy ) );
+        V ( show_stats ( proxy ) );
         if ( handle_new_stream ( proxy, stream ) == -2 )
         {
             return -1;
@@ -1088,7 +1160,7 @@ static int handle_streams_cycle ( struct proxy_t *proxy )
     /* Watch streams events */
     if ( ( status = watch_streams ( proxy ) ) < 0 )
     {
-        S ( printf ( "[vsck] event watch failed: %i\n", errno ) );
+        V ( printf ( "[vsck] event watch failed: %i\n", errno ) );
         return -1;
     }
 
@@ -1097,7 +1169,7 @@ static int handle_streams_cycle ( struct proxy_t *proxy )
     {
         reduce_streams ( proxy );
         cleanup_streams ( proxy );
-        S ( show_stats ( proxy ) );
+        V ( show_stats ( proxy ) );
         return 0;
     }
 
@@ -1140,19 +1212,37 @@ int proxy_task ( struct proxy_t *proxy )
     memset ( proxy->stream_pool, '\0', sizeof ( proxy->stream_pool ) );
 
     /* Create epoll fd if possible */
+#ifdef EPOLL_CREATE_ANY
     if ( ( proxy->epoll_fd = epoll_create ( 0 ) ) >= 0 )
     {
-        S ( printf ( "[vsck] epoll initialized.\n" ) );
+        V ( printf ( "[axpr] epoll initialized.\n" ) );
 
     } else
     {
-        S ( printf ( "[vsck] epoll not supported.\n" ) );
+        if ( ( proxy->epoll_fd = epoll_create1 ( 0 ) ) >= 0 )
+        {
+            V ( printf ( "[axpr] epoll-1 initialized.\n" ) );
+
+        } else
+        {
+            V ( printf ( "[axpr] epoll not supported.\n" ) );
+        }
     }
+#else
+    if ( ( proxy->epoll_fd = EPOLL_CREATE ( 0 ) ) >= 0 )
+    {
+        V ( printf ( "[axpr] epoll initialized.\n" ) );
+
+    } else
+    {
+        V ( printf ( "[axpr] epoll not supported.\n" ) );
+    }
+#endif
 
     /* Setup listen socket */
     if ( ( sock = listen_socket ( proxy->listen_addr, proxy->listen_port ) ) < 0 )
     {
-        S ( printf ( "[vsck] bind socket failed: %i\n", errno ) );
+        V ( printf ( "[vsck] bind socket failed: %i\n", errno ) );
         if ( proxy->epoll_fd >= 0 )
         {
             close ( proxy->epoll_fd );
@@ -1175,7 +1265,7 @@ int proxy_task ( struct proxy_t *proxy )
     stream->role = L_ACCEPT;
     stream->events = POLLIN;
 
-    S ( printf ( "[vsck] setup successful.\n" ) );
+    V ( printf ( "[vsck] setup successful.\n" ) );
 
     /* Run forward loop */
     while ( ( status = handle_streams_cycle ( proxy ) ) >= 0 );
@@ -1193,7 +1283,7 @@ int proxy_task ( struct proxy_t *proxy )
         proxy->epoll_fd = -1;
     }
 
-    S ( printf ( "[vsck] free done.\n" ) );
+    V ( printf ( "[vsck] free done.\n" ) );
 
     return status;
 }

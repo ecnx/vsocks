@@ -9,8 +9,8 @@
  */
 static void show_usage ( void )
 {
-    S ( printf
-        ( "[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [dest-addr:dest-port]\n"
+    V ( printf
+        ( "[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [[+]dest-addr:dest-port]\n"
             "\n" "       listen-addr       Gateway address\n"
             "       listen-port       Gateway port\n"
             "       socks5-addr       Socks server address\n"
@@ -69,9 +69,10 @@ static int ip_port_decode ( const char *input, unsigned int *addr, unsigned shor
 int main ( int argc, char *argv[] )
 {
     struct proxy_t proxy;
+    const char *dest_addr_port;
 
     /* Show program version */
-    S ( printf ( "[vsck] VSocks - ver. " VSOCKS_VERSION "\n" ) );
+    V ( printf ( "[vsck] VSocks - ver. " VSOCKS_VERSION "\n" ) );
 
     /* Validate arguments count */
     if ( argc < 3 )
@@ -96,13 +97,20 @@ int main ( int argc, char *argv[] )
 
     if ( argc > 3 )
     {
-        if ( ip_port_decode ( argv[3], &proxy.dest_addr, &proxy.dest_port ) < 0 )
+        dest_addr_port = argv[3];
+
+        if ( dest_addr_port[0] == '+' )
+        {
+            proxy.use_second_handshake = 1;
+            dest_addr_port++;
+        }
+
+        if ( ip_port_decode ( dest_addr_port, &proxy.dest_addr, &proxy.dest_port ) < 0 )
         {
             show_usage (  );
             return 1;
         }
     }
-
 #ifndef VERBOSE_MODE
     if ( daemon ( 0, 0 ) < 0 )
     {
@@ -116,17 +124,17 @@ int main ( int argc, char *argv[] )
         {
             if ( errno == EINTR || errno == ENOTCONN )
             {
-                S ( printf ( "[vsck] retrying in 1 sec...\n" ) );
+                V ( printf ( "[vsck] retrying in 1 sec...\n" ) );
                 sleep ( 1 );
 
             } else
             {
-                S ( printf ( "[vsck] exit status: %i\n", errno ) );
+                V ( printf ( "[vsck] exit status: %i\n", errno ) );
                 return 1;
             }
         }
     }
 
-    S ( printf ( "[vsck] exit status: success\n" ) );
+    V ( printf ( "[vsck] exit status: success\n" ) );
     return 0;
 }

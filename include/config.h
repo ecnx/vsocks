@@ -27,9 +27,9 @@
 #endif
 
 #ifdef VERBOSE_MODE
-#define S(X) X
+#define V(X) X
 #else
-#define S(X)
+#define V(X)
 #endif
 
 #define PROXY_STATUS_STOPPED 0
