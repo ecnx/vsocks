@@ -889,17 +889,15 @@ static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream 
     case LEVEL_SOCKS_PASS:
         if ( stream->revents & POLLIN )
         {
-            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 4 )
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 2 )
             {
                 return -1;
             }
-
-            /* Check for error */
-            if ( arr[0] != 5 || arr[1] != 0 || arr[3] != 1 )
+            /* Analyse received response */
+            if ( arr[0] != 5 || arr[1] != 0 )
             {
                 return -1;
             }
-
             if ( proxy->use_second_handshake )
             {
                 /* Send version */
@@ -961,12 +959,12 @@ static int handle_stream_socks ( struct proxy_t *proxy, struct stream_t *stream 
     case LEVEL_SOCKS_PASS_2:
         if ( stream->revents & POLLIN )
         {
-            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 4 )
+            if ( ( ssize_t ) ( len = recv ( stream->fd, arr, sizeof ( arr ), 0 ) ) < 2 )
             {
                 return -1;
             }
-            /* Check for error */
-            if ( arr[0] != 5 || arr[1] != 0 || arr[3] != 1 )
+            /* Analyse received response */
+            if ( arr[0] != 5 || arr[1] != 0 )
             {
                 return -1;
             }
@@ -1215,27 +1213,27 @@ int proxy_task ( struct proxy_t *proxy )
 #ifdef EPOLL_CREATE_ANY
     if ( ( proxy->epoll_fd = epoll_create ( 0 ) ) >= 0 )
     {
-        V ( printf ( "[axpr] epoll initialized.\n" ) );
+        V ( printf ( "[vsck] epoll initialized.\n" ) );
 
     } else
     {
         if ( ( proxy->epoll_fd = epoll_create1 ( 0 ) ) >= 0 )
         {
-            V ( printf ( "[axpr] epoll-1 initialized.\n" ) );
+            V ( printf ( "[vsck] epoll-1 initialized.\n" ) );
 
         } else
         {
-            V ( printf ( "[axpr] epoll not supported.\n" ) );
+            V ( printf ( "[vsck] epoll not supported.\n" ) );
         }
     }
 #else
     if ( ( proxy->epoll_fd = EPOLL_CREATE ( 0 ) ) >= 0 )
     {
-        V ( printf ( "[axpr] epoll initialized.\n" ) );
+        V ( printf ( "[vsck] epoll initialized.\n" ) );
 
     } else
     {
-        V ( printf ( "[axpr] epoll not supported.\n" ) );
+        V ( printf ( "[vsck] epoll not supported.\n" ) );
     }
 #endif
 
