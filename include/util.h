@@ -135,24 +135,24 @@ extern int handle_stream_events ( struct proxy_t *proxy, struct stream_t *stream
 /**
  * Decode ip address and port number
  */
-extern int ip_port_decode ( const char *input, struct sockaddr_storage* saddr);
+extern int ip_port_decode ( const char *input, struct sockaddr_storage *saddr );
 
 /**
  * Format IP address adn port to string
  */
-extern void format_ip_port ( const struct sockaddr_storage* saddr, char *buffer, size_t size );
+extern void format_ip_port ( const struct sockaddr_storage *saddr, char *buffer, size_t size );
 
 /* NOTE: Socket Related Functions */
 
 /**
  * Connect remote endpoint asynchronously
  */
-extern int connect_async ( struct proxy_t *proxy, const struct sockaddr_storage * saddr );
+extern int connect_async ( struct proxy_t *proxy, const struct sockaddr_storage *saddr );
 
 /**
  * Bind address to listen socket
  */
-extern int listen_socket ( struct proxy_t *proxy, const struct sockaddr_storage* saddr );
+extern int listen_socket ( struct proxy_t *proxy, const struct sockaddr_storage *saddr );
 
 /**
  * Check for socket error
