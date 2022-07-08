@@ -22,16 +22,26 @@ To setup Socks5 Server you could use another project here: axproxy
 axproxy socks-proxy-addr:socks-proxy-port
 ```
 
+If you need to connect Socks5 Server via Bridge (e.g. Tor) use:
+```
+vsocks 0.0.0.0 12345 socks-proxy-addr socks-proxy-port +127.0.0.1:9050
+```
+
 Usage message:
 --------------
 ```
-[vsck] VSocks - ver. 1.04.2a
-[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port
+[vsck] [vsck] VSocks - ver. 1.05.1a
+[vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [[+]dest-addr:dest-port]
 
+       option -v         Enable verbose logging
+       option -d         Run in background
        listen-addr       Gateway address
        listen-port       Gateway port
        socks5-addr       Socks server address
        socks5-port       Socks-5 server port
+       dest-addr         Destination address override
+       dest-port         Destination port override
+
 
 ```
 
