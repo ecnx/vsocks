@@ -1,14 +1,17 @@
-License: GPL
-
-Why?
-----
+Purpose
+-------
 Make a wifi hotspot with IP/TCP traffic redirected over Socks5 Proxy.  
 For example to connect a phone device behind the proxy.  
-Note: DNS traffic is not redirected.  
+Note: DNS traffic is not redirected. IPv6 networking supported.
 
-How to?
+Building
+--------
+```
+make
+```
+
+Example
 -------
-Build with make, then run:
 ```
 iptables -t nat -N VSOCKS
 iptables -t nat -A VSOCKS -p tcp -j REDIRECT --to-ports 12345
@@ -22,13 +25,8 @@ To setup Socks5 Server you could use another project here: axproxy
 axproxy socks-proxy-addr:socks-proxy-port
 ```
 
-If you need to connect Socks5 Server via Bridge (e.g. Tor) use:
-```
-vsocks 0.0.0.0 12345 socks-proxy-addr socks-proxy-port +127.0.0.1:9050
-```
-
-Usage message:
---------------
+Help message
+------------
 ```
 [vsck] [vsck] VSocks - ver. 1.05.1a
 [vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [[+]dest-addr:dest-port]
