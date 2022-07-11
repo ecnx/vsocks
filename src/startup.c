@@ -29,7 +29,7 @@ int main ( int argc, char *argv[] )
     struct proxy_t proxy = { 0 };
 
     /* Show program version */
-    info ( "[vsck] VSocks - ver. " VSOCKS_VERSION "\n" );
+    info ( "VSocks - ver. " VSOCKS_VERSION "\n" );
 
     /* Validate arguments count */
     if ( argc < 3 )
