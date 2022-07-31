@@ -28,7 +28,7 @@ axproxy socks-proxy-addr:socks-proxy-port
 Help message
 ------------
 ```
-[vsck] [vsck] VSocks - ver. 1.05.1a
+[vsck] VSocks - ver. 1.05.1a
 [vsck] usage: vsocks listen-addr:listen-port socks5-addr:socks5s-port [[+]dest-addr:dest-port]
 
        option -v         Enable verbose logging
